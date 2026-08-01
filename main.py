@@ -58,7 +58,7 @@ async def obtener_catalogo_playwright():
         page = await browser.new_page()
         
         await page.goto(URL_GAME)
-        await page.wait_for_selector('.figure', timeout=15000)
+        await page.wait_for_timeout(7000)
         
         # --- LÓGICA DE SCROLL MEJORADA ---
         intentos_vacios = 0
