@@ -10,13 +10,27 @@ from threading import Thread
 TOKEN = os.getenv('DISCORD_TOKEN')
 URL_GAME = 'https://www.game.es/buscar/amiibo' 
 ARCHIVO_COLECCION = 'mi_coleccion.json'
-ARCHIVO_ULTIMO_CATALOGO = 'ultimo_catalogo.json' # Nuevo archivo para guardar el estado anterior
+ARCHIVO_ULTIMO_CATALOGO = 'ultimo_catalogo.json'
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Funciones de tu colección
+# --- CONFIGURACIÓN DEL SERVIDOR WEB ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot activo"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+# --------------------------------------
+
 def cargar_coleccion():
     if os.path.exists(ARCHIVO_COLECCION):
         with open(ARCHIVO_COLECCION, 'r', encoding='utf-8') as f:
@@ -27,7 +41,6 @@ def guardar_coleccion(coleccion):
     with open(ARCHIVO_COLECCION, 'w', encoding='utf-8') as f:
         json.dump(coleccion, f, ensure_ascii=False, indent=4)
 
-# Funciones para el detector de cambios del catálogo
 def cargar_ultimo_catalogo():
     if os.path.exists(ARCHIVO_ULTIMO_CATALOGO):
         with open(ARCHIVO_ULTIMO_CATALOGO, 'r', encoding='utf-8') as f:
@@ -46,6 +59,27 @@ async def obtener_catalogo_playwright():
         await page.goto(URL_GAME)
         await page.wait_for_selector('.figure', timeout=15000)
         
+        # --- NUEVA LÓGICA DE SCROLL ---
+        # Guarda la altura actual de la página
+        altura_anterior = await page.evaluate("document.body.scrollHeight")
+        
+        # Repite el scroll hasta 10 veces para buscar más productos
+        for _ in range(10):
+            # Baja hasta el fondo de la página
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            # Espera 2 segundos para dar tiempo a que aparezcan los nuevos Amiibos
+            await page.wait_for_timeout(2000)
+            
+            # Comprueba la nueva altura
+            altura_nueva = await page.evaluate("document.body.scrollHeight")
+            
+            # Si la altura no ha cambiado, significa que ya no hay más productos
+            if altura_nueva == altura_anterior:
+                break
+                
+            altura_anterior = altura_nueva
+        # ------------------------------
+        
         html = await page.content()
         await browser.close()
         
@@ -56,7 +90,7 @@ async def obtener_catalogo_playwright():
     coleccion = [c.lower() for c in cargar_coleccion()]
     
     ultimo_catalogo = cargar_ultimo_catalogo()
-    catalogo_actual = {} # Aquí guardaremos lo que hay ahora en la web
+    catalogo_actual = {} 
     
     total_encontrados = 0
     tengo_count = 0
@@ -102,24 +136,20 @@ async def obtener_catalogo_playwright():
                     
                 lista_smash.append(texto)
                 
-    # --- LÓGICA DE COMPARACIÓN ---
     nuevos = []
     desaparecidos = []
     
-    # Comprobar qué hay nuevo
     for nombre, precio in catalogo_actual.items():
         if nombre not in ultimo_catalogo:
             nuevos.append(f"{nombre} — {precio}€")
             
-    # Comprobar qué ha desaparecido
     for nombre, precio in ultimo_catalogo.items():
         if nombre not in catalogo_actual:
             desaparecidos.append(f"{nombre} — {precio}€")
             
     texto_cambios = ""
-    # Si es la primera vez que se ejecuta (archivo vacío), evitamos que todo salga como nuevo
     if not ultimo_catalogo:
-        texto_cambios = "No hay nuevos cambios.\n"
+        texto_cambios = "No hay nuevos cambios\n"
     elif nuevos or desaparecidos:
         if nuevos:
             texto_cambios += "**Nuevo:**\n"
@@ -130,13 +160,11 @@ async def obtener_catalogo_playwright():
             for item in desaparecidos:
                 texto_cambios += f"     {item}\n"
     else:
-        texto_cambios = "No hay nuevos cambios.\n"
+        texto_cambios = "No hay nuevos cambios\n"
         
-    # Guardamos el catálogo actual para compararlo la próxima vez
     guardar_ultimo_catalogo(catalogo_actual)
     
-    # Construimos el texto superior
-    resumen = f"📊 Total: **{total_encontrados}** | ✅ **{tengo_count}** | ❌ **{no_tengo_count}**\n\n{texto_cambios}\n"
+    resumen = f"📊 Total: {total_encontrados} | ✅ {tengo_count} | ❌ {no_tengo_count}\n\n{texto_cambios}\n"
     return resumen, lista_smash
 
 @bot.command(name='añadir')
@@ -199,7 +227,7 @@ async def mostrar_ayuda(ctx):
 
 @bot.command(name='catalogo')
 async def mostrar_catalogo(ctx):
-    mensaje_espera = await ctx.send("Abriendo catalogo...")
+    mensaje_espera = await ctx.send("Abriendo catalogo y buscando todos los productos...")
     
     try:
         resumen, smash = await obtener_catalogo_playwright()
@@ -209,6 +237,10 @@ async def mostrar_catalogo(ctx):
             return
 
         descripcion_total = resumen + "\n".join(smash)
+
+        # Discord tiene un límite de 4096 caracteres para la descripción del embed
+        if len(descripcion_total) > 4096:
+            descripcion_total = descripcion_total[:4093] + "..."
 
         embed = discord.Embed(
             title="🛒 Catálogo de Amiibos (Smash)",
@@ -225,19 +257,6 @@ async def mostrar_catalogo(ctx):
 @bot.event
 async def on_ready():
     print(f'Bot conectado como {bot.user}')
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot activo"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
 
 if __name__ == '__main__':
     keep_alive()
