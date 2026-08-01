@@ -59,26 +59,29 @@ async def obtener_catalogo_playwright():
         await page.goto(URL_GAME)
         await page.wait_for_selector('.figure', timeout=15000)
         
-        # --- NUEVA LÓGICA DE SCROLL ---
-        # Guarda la altura actual de la página
-        altura_anterior = await page.evaluate("document.body.scrollHeight")
-        
-        # Repite el scroll hasta 10 veces para buscar más productos
-        for _ in range(10):
-            # Baja hasta el fondo de la página
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            # Espera 2 segundos para dar tiempo a que aparezcan los nuevos Amiibos
-            await page.wait_for_timeout(2000)
+        # --- LÓGICA DE SCROLL MEJORADA ---
+        intentos_vacios = 0
+        for _ in range(15): # Aumentamos el máximo de veces que puede bajar
+            altura_anterior = await page.evaluate("document.body.scrollHeight")
             
-            # Comprueba la nueva altura
+            # Bajamos hasta abajo
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            
+            # Esperamos un poco más (2.5 segundos)
+            await page.wait_for_timeout(2500)
+            
             altura_nueva = await page.evaluate("document.body.scrollHeight")
             
-            # Si la altura no ha cambiado, significa que ya no hay más productos
+            # Si la altura es igual, suma un fallo
             if altura_nueva == altura_anterior:
-                break
-                
-            altura_anterior = altura_nueva
-        # ------------------------------
+                intentos_vacios += 1
+                # Solo se rinde si ha fallado 2 veces seguidas
+                if intentos_vacios >= 2:
+                    break
+            else:
+                # Si ha cargado algo nuevo, resetea los fallos a 0
+                intentos_vacios = 0
+        # ---------------------------------
         
         html = await page.content()
         await browser.close()
@@ -227,7 +230,7 @@ async def mostrar_ayuda(ctx):
 
 @bot.command(name='catalogo')
 async def mostrar_catalogo(ctx):
-    mensaje_espera = await ctx.send("Abriendo catalogo y buscando todos los productos...")
+    mensaje_espera = await ctx.send("Abriendo catalogo...")
     
     try:
         resumen, smash = await obtener_catalogo_playwright()
