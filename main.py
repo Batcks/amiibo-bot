@@ -6,6 +6,7 @@ import json
 import os
 from flask import Flask
 from threading import Thread
+import time
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 URL_GAME = 'https://www.game.es/buscar/amiibo' 
@@ -232,8 +233,13 @@ async def mostrar_ayuda(ctx):
 async def mostrar_catalogo(ctx):
     mensaje_espera = await ctx.send("Abriendo catalogo...")
     
+    tiempo_inicio = time.time()
+    
     try:
         resumen, smash = await obtener_catalogo_playwright()
+        
+        tiempo_fin = time.time()
+        resultado = round(tiempo_fin - tiempo_inicio, 1)
         
         if not smash:
             await mensaje_espera.edit(content="No hay resultados de Smash en la web.")
@@ -241,7 +247,6 @@ async def mostrar_catalogo(ctx):
 
         descripcion_total = resumen + "\n".join(smash)
 
-        # Discord tiene un límite de 4096 caracteres para la descripción del embed
         if len(descripcion_total) > 4096:
             descripcion_total = descripcion_total[:4093] + "..."
 
@@ -252,7 +257,9 @@ async def mostrar_catalogo(ctx):
         )
             
         await mensaje_espera.delete()
-        await ctx.send(embed=embed)
+        
+        # Envía el tiempo como un mensaje de texto normal en Discord y adjunta el catálogo
+        await ctx.send(content=f"**Tiempo de respuesta: {resultado}s**", embed=embed)
             
     except Exception as e:
         await mensaje_espera.edit(content=f"Ha ocurrido un error al cargar la web: {e}")
