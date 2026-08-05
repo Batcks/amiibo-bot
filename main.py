@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 from bs4 import BeautifulSoup
 import aiohttp
 import asyncio
@@ -252,18 +253,18 @@ async def obtener_catalogo_api():
     return resumen, lista_smash, lista_reacondicionados
 
 
-@bot.command(name='añadir')
-async def añadir_coleccion(ctx, *, nombre: str):
+@bot.tree.command(name='añadir',description='Añade un amiibo a la colección')
+async def añadir_coleccion(interaction: discord.Interaction, *, nombre: str):
     coleccion = cargar_coleccion()
     if nombre not in coleccion:
         coleccion.append(nombre)
         guardar_coleccion(coleccion)
-        await ctx.send(f"Añadido a tu colección: **{nombre}**")
+        await interaction.response.send_message(f"Añadido a tu colección: **{nombre}**")
     else:
-        await ctx.send(f"**{nombre}** ya estaba en tu colección.")
+        await interaction.response.send_message(f"**{nombre}** ya estaba en tu colección.")
 
-@bot.command(name='quitar')
-async def quitar_coleccion(ctx, *, nombre: str):
+@bot.tree.command(name='quitar',description='Quita un amiibo de la colección')
+async def quitar_coleccion(interaction: discord.Interaction, *, nombre: str):
     coleccion = cargar_coleccion()
     encontrado = None
     for item in coleccion:
@@ -274,32 +275,35 @@ async def quitar_coleccion(ctx, *, nombre: str):
     if encontrado:
         coleccion.remove(encontrado)
         guardar_coleccion(coleccion)
-        await ctx.send(f"Eliminado de tu colección: **{encontrado}**")
+        await interaction.response.send_message(f"Eliminado de tu colección: **{encontrado}**")
     else:
-        await ctx.send(f"No se encontró **{nombre}** en tu colección.")
+        await interaction.response.send_message(f"No se encontró **{nombre}** en tu colección.")
 
-@bot.command(name='coleccion')
-async def mostrar_coleccion(ctx):
+@bot.tree.command(name='coleccion',description='Muestra la colección de amiibo')
+async def mostrar_coleccion(interaction: discord.Interaction):
     coleccion = cargar_coleccion()
 
     if not coleccion:
-        await ctx.send("Tu colección está vacía actualmente.")
+        await interaction.response.send_message("Tu colección está vacía actualmente.")
         return
+
+    # Usamos defer() si creemos que puede tardar, o simplemente respondemos
+    await interaction.response.defer()
 
     mensaje = "**Tus Amiibos guardados:**\n"
     for item in coleccion:
         linea = f"• {item}\n"
         if len(mensaje) + len(linea) > 1900:
-            await ctx.send(mensaje)
+            await interaction.followup.send(mensaje)
             mensaje = linea
         else:
             mensaje += linea
 
     if mensaje:
-        await ctx.send(mensaje)
+        await interaction.followup.send(mensaje)
 
-@bot.command(name='ayuda')
-async def mostrar_ayuda(ctx):
+@bot.tree.command(name='ayuda',description='Muestra los comandos del bot y sus funciones')
+async def mostrar_ayuda(interaction: discord.Interaction):
     texto_ayuda = (
         "**Comandos del Bot:**\n"
         "• `!catalogo` - Muestra los Amiibos de Smash en un panel continuo.\n"
@@ -308,27 +312,27 @@ async def mostrar_ayuda(ctx):
         "• `!quitar [nombre]` - Elimina un Amiibo de tu colección personal.\n"
         "• `!ayuda` - Muestra este menú de ayuda."
     )
-    await ctx.send(texto_ayuda)
+    await interaction.response.send_message(texto_ayuda)
 
-@bot.command(name='catalogo')
-@commands.cooldown(1, 15, commands.BucketType.guild)
-async def mostrar_catalogo(ctx):
-    mensaje_espera = await ctx.send("Abriendo catalogo...")
+@bot.tree.command(name='catalogo', description='Muestra el catálogo de Amiibos de GAME')
+@app_commands.checks.cooldown(1, 15, key=lambda i: i.guild_id)
+async def mostrar_catalogo(interaction: discord.Interaction):
+    # 1. Mensaje inicial obligatorio
+    await interaction.response.send_message("Abriendo catalogo...")
     tiempo_inicio = time.time()
 
     try:
-        # Llama a la nueva función que acabas de crear
         resumen, smash_normales, smash_reacondicionados = await obtener_catalogo_api()
 
         tiempo_fin = time.time()
         resultado = round(tiempo_fin - tiempo_inicio, 1)
 
         if not smash_normales and not smash_reacondicionados:
-            await mensaje_espera.edit(content="No hay resultados de Smash en la web.")
+            await interaction.edit_original_response(content="No hay resultados de Smash en la web.")
             return
 
-        await mensaje_espera.delete()
-        await ctx.send(content=f"**Tiempo de respuesta: {resultado}s**")
+        # 2. Modificamos el mensaje inicial de carga con el tiempo de respuesta
+        await interaction.edit_original_response(content=f"**Tiempo de respuesta: {resultado}s**")
 
         # --- PRIMER EMBED: Amiibos normales ---
         descripcion_normal = resumen + "\n".join(smash_normales)
@@ -340,7 +344,9 @@ async def mostrar_catalogo(ctx):
             description=descripcion_normal,
             color=discord.Color.blue()
         )
-        await ctx.send(embed=embed_normal)
+        
+        # Para enviar los embeds extra usamos followup porque ya respondimos antes
+        await interaction.followup.send(embed=embed_normal)
 
         # --- SEGUNDO EMBED: Amiibos reacondicionados ---
         if smash_reacondicionados:
@@ -353,20 +359,21 @@ async def mostrar_catalogo(ctx):
                 description=descripcion_reac,
                 color=discord.Color.green()
             )
-            await ctx.send(embed=embed_reac)
+            await interaction.followup.send(embed=embed_reac)
 
     except Exception as e:
-        await mensaje_espera.edit(content=f"Ha ocurrido un error al cargar la web: {e}")
+        await interaction.edit_original_response(content=f"Ha ocurrido un error al cargar la web: {e}")
 
 @mostrar_catalogo.error
-async def mostrar_catalogo_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"Espera {error.retry_after:.0f}s antes de volver a pedir el catálogo.")
+async def mostrar_catalogo_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(f"Espera {error.retry_after:.0f}s antes de volver a pedir el catálogo.", ephemeral=True)
     else:
         raise error
 
 @bot.event
 async def on_ready():
+    await bot.tree.sync()
     print(f'Bot conectado como {bot.user}')
 if __name__ == '__main__':
     keep_alive()
