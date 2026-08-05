@@ -54,44 +54,31 @@ def guardar_ultimo_catalogo(catalogo):
 
 async def obtener_catalogo_playwright():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        # Añadido los comandos para usar menos memoria en Render
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-dev-shm-usage']
+        )
+        page = await browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         
         await page.goto(URL_GAME)
-        await page.wait_for_selector('.figure', timeout=15000)
-
         
-        # --- LÓGICA DE SCROLL MEJORADA ---
-        intentos_vacios = 0
-        for _ in range(15): # Aumentamos el máximo de veces que puede bajar
-            altura_anterior = await page.evaluate("document.body.scrollHeight")
-            
-            # Bajamos hasta abajo
+        await page.wait_for_selector('.figure', state='attached', timeout=15000)
+        await page.wait_for_timeout(3000)
+        
+        for _ in range(10):
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            
-            # Esperamos un poco más (2.5 segundos)
-            await page.wait_for_timeout(2500)
-            
-            altura_nueva = await page.evaluate("document.body.scrollHeight")
-            
-            # Si la altura es igual, suma un fallo
-            if altura_nueva == altura_anterior:
-                intentos_vacios += 1
-                # Solo se rinde si ha fallado 2 veces seguidas
-                if intentos_vacios >= 2:
-                    break
-            else:
-                # Si ha cargado algo nuevo, resetea los fallos a 0
-                intentos_vacios = 0
-        # ---------------------------------
+            await page.wait_for_timeout(3000)
         
         html = await page.content()
         await browser.close()
         
     soup = BeautifulSoup(html, 'html.parser')
-    cajas = soup.find_all('a', class_='figure') 
+    # Buscamos la "caja grande" de cada producto en lugar de solo el enlace
+    articulos = soup.find_all('div', class_='search-item') 
     
     lista_smash = []
+    lista_reacondicionados = []
     coleccion = [c.lower() for c in cargar_coleccion()]
     
     ultimo_catalogo = cargar_ultimo_catalogo()
@@ -101,7 +88,12 @@ async def obtener_catalogo_playwright():
     tengo_count = 0
     no_tengo_count = 0
     
-    for caja in cajas:
+    for articulo in articulos:
+        # Extraemos la "caja pequeña" donde están los datos ocultos
+        caja = articulo.find('a', class_='figure')
+        if not caja:
+            continue
+            
         nombre = caja.get('data-list-item-name')
         precio_str = caja.get('data-list-item-price')
         link = caja.get('href')
@@ -109,12 +101,8 @@ async def obtener_catalogo_playwright():
         if nombre and precio_str:
             nombre_lower = nombre.lower()
             
-            if "reacondicionado" in nombre_lower:
-                continue
-            
             if "smash" in nombre_lower:
-                catalogo_actual[nombre] = precio_str
-                total_encontrados += 1
+                es_reacondicionado = "reacondicionado" in nombre_lower
                 lo_tengo = any(item in nombre_lower for item in coleccion)
                 
                 try:
@@ -122,25 +110,65 @@ async def obtener_catalogo_playwright():
                     precio_num = float(precio_limpio)
                 except ValueError:
                     precio_num = 15.00
-                
-                if lo_tengo:
-                    tengo_count += 1
-                    texto = f"**~~{nombre}~~** — {precio_str}€"
-                else:
-                    no_tengo_count += 1
-                    alerta = " 🚨" if precio_num < 14.99 else ""
+
+                # --- ARREGLO PARA PRECIOS A 0€ ---
+                if precio_num == 0:
+                    # Buscamos el precio en toda la caja grande
+                    entero = articulo.find('span', class_='int')
+                    decimal = articulo.find('span', class_='decimal')
                     
-                    if link:
-                        if link.startswith('/'):
-                            link_completo = f"https://www.game.es{link}"
-                        else:
-                            link_completo = link
-                        texto = f"{nombre} — {precio_str}€{alerta} ([Ver web]({link_completo}))"
+                    if entero:
+                        precio_str = entero.text.strip()
+                        if decimal:
+                            # Limpiamos la comilla del decimal que muestra la web
+                            dec_texto = decimal.text.strip().replace("'", "").replace(",", "")
+                            precio_str += "," + dec_texto
+                        
+                        try:
+                            precio_num = float(precio_str.replace(',', '.'))
+                        except ValueError:
+                            precio_num = 15.00
+                # ---------------------------------
+                
+                if es_reacondicionado:
+                    # Formato para reacondicionados igual que el normal (con precio, sin alerta)
+                    if lo_tengo:
+                        texto = f"**~~{nombre}~~** — {precio_str}€"
                     else:
-                        texto = f"{nombre} — {precio_str}€{alerta}"
+                        if link:
+                            if link.startswith('/'):
+                                link_completo = f"https://www.game.es{link}"
+                            else:
+                                link_completo = link
+                            texto = f"{nombre} — {precio_str}€ ([Ver web]({link_completo}))"
+                        else:
+                            texto = f"{nombre} — {precio_str}€"
+                            
+                    lista_reacondicionados.append(texto)
+                else:
+                    # Formato para Amiibos nuevos (se mantiene igual)
+                    catalogo_actual[nombre] = precio_str
+                    total_encontrados += 1
                     
-                lista_smash.append(texto)
-                
+                    if lo_tengo:
+                        tengo_count += 1
+                        texto = f"**~~{nombre}~~** — {precio_str}€"
+                    else:
+                        no_tengo_count += 1
+                        # Aquí la alarma se queda funcionando para los nuevos
+                        alerta = " 🚨" if precio_num < 14.99 else ""
+                        
+                        if link:
+                            if link.startswith('/'):
+                                link_completo = f"https://www.game.es{link}"
+                            else:
+                                link_completo = link
+                            texto = f"{nombre} — {precio_str}€{alerta} ([Ver web]({link_completo}))"
+                        else:
+                            texto = f"{nombre} — {precio_str}€{alerta}"
+                            
+                    lista_smash.append(texto)
+                    
     nuevos = []
     desaparecidos = []
     
@@ -169,8 +197,9 @@ async def obtener_catalogo_playwright():
         
     guardar_ultimo_catalogo(catalogo_actual)
     
-    resumen = f"📊 Total: {total_encontrados} | ✅ {tengo_count} | ❌ {no_tengo_count}\n\n{texto_cambios}\n"
-    return resumen, lista_smash
+    resumen = f"📊 Total: {total_encontrados} + (♻️ {len(lista_reacondicionados)}) | ✅ {tengo_count} | ❌ {no_tengo_count}\n\n{texto_cambios}\n"
+    
+    return resumen, lista_smash, lista_reacondicionados
 
 @bot.command(name='añadir')
 async def añadir_coleccion(ctx, *, nombre: str):
@@ -237,30 +266,46 @@ async def mostrar_catalogo(ctx):
     tiempo_inicio = time.time()
     
     try:
-        resumen, smash = await obtener_catalogo_playwright()
+        # Ahora recibimos las dos listas por separado
+        resumen, smash_normales, smash_reacondicionados = await obtener_catalogo_playwright()
         
         tiempo_fin = time.time()
         resultado = round(tiempo_fin - tiempo_inicio, 1)
         
-        if not smash:
+        if not smash_normales and not smash_reacondicionados:
             await mensaje_espera.edit(content="No hay resultados de Smash en la web.")
             return
 
-        descripcion_total = resumen + "\n".join(smash)
+        await mensaje_espera.delete()
+        await ctx.send(content=f"**Tiempo de respuesta: {resultado}s**")
 
-        if len(descripcion_total) > 4096:
-            descripcion_total = descripcion_total[:4093] + "..."
-
-        embed = discord.Embed(
+        # --- PRIMER EMBED: Amiibos normales ---
+        descripcion_normal = resumen + "\n".join(smash_normales)
+        
+        # Cortamos a las 4096 letras solo como medida de seguridad extrema
+        if len(descripcion_normal) > 4096:
+            descripcion_normal = descripcion_normal[:4093] + "..."
+            
+        embed_normal = discord.Embed(
             title="🛒 Catálogo de Amiibos (Smash)",
-            description=descripcion_total,
+            description=descripcion_normal,
             color=discord.Color.blue()
         )
-            
-        await mensaje_espera.delete()
+        await ctx.send(embed=embed_normal)
         
-        # Envía el tiempo como un mensaje de texto normal en Discord y adjunta el catálogo
-        await ctx.send(content=f"**Tiempo de respuesta: {resultado}s**", embed=embed)
+        # --- SEGUNDO EMBED: Amiibos reacondicionados ---
+        if smash_reacondicionados:
+            descripcion_reac = "\n".join(smash_reacondicionados)
+            
+            if len(descripcion_reac) > 4096:
+                descripcion_reac = descripcion_reac[:4093] + "..."
+                
+            embed_reac = discord.Embed(
+                title="♻️ Reacondicionados",
+                description=descripcion_reac,
+                color=discord.Color.green()
+            )
+            await ctx.send(embed=embed_reac)
             
     except Exception as e:
         await mensaje_espera.edit(content=f"Ha ocurrido un error al cargar la web: {e}")
