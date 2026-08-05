@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+import aiohttp
 import asyncio
 import json
 import os
@@ -54,62 +54,6 @@ def guardar_ultimo_catalogo(catalogo):
     with open(ARCHIVO_ULTIMO_CATALOGO, 'w', encoding='utf-8') as f:
         json.dump(catalogo, f, ensure_ascii=False, indent=4)
 
-
-# --- NAVEGADOR PERSISTENTE ---
-# Antes se lanzaba un Chromium nuevo en cada !catalogo (coste de arranque
-# innecesario). Ahora se mantiene un único navegador vivo y solo se abre/
-# cierra una pestaña (page) por consulta, que es mucho más barato.
-_playwright_instance = None
-_browser_instance = None
-_browser_lock = asyncio.Lock()
-_catalogo_lock = asyncio.Lock()  # evita ejecuciones simultáneas de !catalogo
-
-async def obtener_browser():
-    global _playwright_instance, _browser_instance
-    async with _browser_lock:
-        if _browser_instance is None or not _browser_instance.is_connected():
-            if _playwright_instance is None:
-                _playwright_instance = await async_playwright().start()
-            _browser_instance = await _playwright_instance.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage']
-            )
-        return _browser_instance
-
-async def cerrar_browser():
-    """Fuerza el relanzamiento del navegador en la siguiente petición
-    (se usa cuando algo ha ido mal, ej. crash o timeout raro)."""
-    global _browser_instance
-    async with _browser_lock:
-        if _browser_instance is not None:
-            try:
-                await _browser_instance.close()
-            except Exception:
-                pass
-            _browser_instance = None
-# ------------------------------
-
-
-async def hacer_scroll_completo(page, max_intentos=15, espera_ms=2500, intentos_estable=3):
-    """Antes: 10 scrolls fijos de 3s cada uno = 30s siempre, cargue lo que
-    cargue la página. Ahora: se hace scroll y se comprueba la altura del
-    documento; si deja de crecer durante `intentos_estable` rondas seguidas,
-    se para. Normalmente termina bastante antes de los 30s originales."""
-    altura_anterior = await page.evaluate("document.body.scrollHeight")
-    estable = 0
-    for _ in range(max_intentos):
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(espera_ms)
-        altura_actual = await page.evaluate("document.body.scrollHeight")
-        if altura_actual == altura_anterior:
-            estable += 1
-            if estable >= intentos_estable:
-                break
-        else:
-            estable = 0
-        altura_anterior = altura_actual
-
-
 def limpiar_precio(precio_str):
     """Convierte '14,99' -> 14.99. Devuelve None si no se puede."""
     if not precio_str:
@@ -160,112 +104,129 @@ def formatear_item(nombre, precio_str, lo_tengo, link=None, precio_num=None, mos
     return f"{nombre} — {precio_str}€{alerta}"
 
 
-async def obtener_catalogo_playwright():
-    browser = await obtener_browser()
-    page = await browser.new_page(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
+async def obtener_catalogo_api():
+    url = 'https://www.game.es/api/search'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+        'Content-Type': 'application/json; charset=UTF-8',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://www.game.es/buscar/amiibo'
+    }
 
-    try:
-        await page.goto(URL_GAME)
-        await page.wait_for_selector('.figure', state='attached', timeout=15000)
-        await page.wait_for_timeout(3000)
+    todos_los_productos = []
+    pagina = 0
 
-        await hacer_scroll_completo(page)
+    async with aiohttp.ClientSession() as session:
+        # 1. Llamada inicial para obtener los permisos
+        await session.get('https://www.game.es/buscar/amiibo', headers={'User-Agent': headers['User-Agent']})
+        
+        # 2. Bucle para pedir todas las páginas en orden real
+        while True:
+            payload = {
+                "MinPrice": None,
+                "MaxPrice": None,
+                "Head": "amiibo",
+                "SKU": "",
+                "Order": 7,
+                "CategoryFilter": [],
+                "Category": None,
+                "TotalPages": None,
+                "FirstSearch": (pagina == 0), # True solo en la página 0
+                "Page": pagina
+            }
 
-        html = await page.content()
-        soup = BeautifulSoup(html, 'html.parser')
-        articulos = soup.find_all('div', class_='search-item')
+            # Si ya no estamos en la página inicial, añadimos las etiquetas de scroll
+            if pagina > 0:
+                payload["CurrentProducts"] = len(todos_los_productos)
+                payload["TotalResults"] = 200
+                payload["HotProducts"] = 0
+                payload["TotalPages"] = 1
 
-        # Red de seguridad: si el scroll "inteligente" se paró antes de que
-        # el catálogo terminara de cargar (lazy-load), seguimos forzando
-        # scrolls como en la versión original hasta encontrar algo o
-        # agotar los intentos.
-        intentos_extra = 0
-        while not articulos and intentos_extra < 6:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(3000)
-            html = await page.content()
-            soup = BeautifulSoup(html, 'html.parser')
-            articulos = soup.find_all('div', class_='search-item')
-            intentos_extra += 1
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status != 200:
+                    break
+                
+                try:
+                    datos = await response.json(content_type=None)
+                    productos_pagina = datos.get("Products", [])
+                    
+                    if not productos_pagina:
+                        break
+                        
+                    todos_los_productos.extend(productos_pagina)
+                except:
+                    break
 
-        print(f"[catalogo] artículos encontrados: {len(articulos)}")
-    finally:
-        await page.close()
+            pagina += 1
+            if pagina > 5: # Límite de seguridad
+                break
 
+    # 3. Procesamos los datos extraídos
     lista_smash = []
     lista_reacondicionados = []
     coleccion = [c.lower() for c in cargar_coleccion()]
-
+    
     ultimo_catalogo = cargar_ultimo_catalogo()
     catalogo_actual = {}
-
+    
     total_encontrados = 0
     tengo_count = 0
     no_tengo_count = 0
-
-    for articulo in articulos:
-        caja = articulo.find('a', class_='figure')
-        if not caja:
+    
+    for producto in todos_los_productos:
+        nombre = producto.get('Name')
+        if not nombre:
             continue
-
-        nombre = caja.get('data-list-item-name')
-        precio_str = caja.get('data-list-item-price')
-        link = caja.get('href')
-
-        if not (nombre and precio_str):
-            continue
-
+            
         nombre_lower = nombre.lower()
         if "smash" not in nombre_lower:
             continue
+            
+        link_parcial = producto.get('Navigation', '')
+        link = f"https://www.game.es/{link_parcial}" if link_parcial else None
+        
+        ofertas = producto.get('Offers', [])
+        precio_num = 15.00
+        if ofertas:
+            precio_num = ofertas[0].get('SellPrice', 15.00)
+            if precio_num is None:
+                precio_num = 15.00
+                
+        precio_str = f"{precio_num:.2f}".replace('.', ',')
 
         es_reacondicionado = "reacondicionado" in nombre_lower
         lo_tengo = any(item in nombre_lower for item in coleccion)
-
-        precio_num = limpiar_precio(precio_str)
-        if precio_num is None:
-            precio_num = 15.00
-
-        # --- ARREGLO PARA PRECIOS A 0€ ---
-        if precio_num == 0:
-            precio_str_respaldo, precio_num_respaldo = extraer_precio_respaldo(articulo)
-            if precio_str_respaldo is not None:
-                precio_str = precio_str_respaldo
-                precio_num = precio_num_respaldo if precio_num_respaldo is not None else 15.00
-        # ---------------------------------
-
+            
         if es_reacondicionado:
             texto = formatear_item(nombre, precio_str, lo_tengo, link=link, mostrar_alerta=False)
             lista_reacondicionados.append(texto)
         else:
             catalogo_actual[nombre] = precio_str
             total_encontrados += 1
-
+            
             if lo_tengo:
                 tengo_count += 1
             else:
                 no_tengo_count += 1
-
+                
             texto = formatear_item(
                 nombre, precio_str, lo_tengo,
                 link=link, precio_num=precio_num, mostrar_alerta=True
             )
             lista_smash.append(texto)
-
+            
     nuevos = []
     desaparecidos = []
-
+    
     for nombre, precio in catalogo_actual.items():
         if nombre not in ultimo_catalogo:
             nuevos.append(f"{nombre} — {precio}€")
-
+            
     for nombre, precio in ultimo_catalogo.items():
         if nombre not in catalogo_actual:
             desaparecidos.append(f"{nombre} — {precio}€")
-
+            
     texto_cambios = ""
     if not ultimo_catalogo:
         texto_cambios = "No hay nuevos cambios\n"
@@ -280,14 +241,14 @@ async def obtener_catalogo_playwright():
                 texto_cambios += f"     {item}\n"
     else:
         texto_cambios = "No hay nuevos cambios\n"
-
+        
     guardar_ultimo_catalogo(catalogo_actual)
-
+    
     resumen = (
-        f"📊 Total: {total_encontrados} + (♻️ {len(lista_reacondicionados)}) "
+        f"📊 Total: {total_encontrados} (♻️ {len(lista_reacondicionados)}) "
         f"| ✅ {tengo_count} | ❌ {no_tengo_count}\n\n{texto_cambios}\n"
     )
-
+    
     return resumen, lista_smash, lista_reacondicionados
 
 
@@ -352,59 +313,50 @@ async def mostrar_ayuda(ctx):
 @bot.command(name='catalogo')
 @commands.cooldown(1, 15, commands.BucketType.guild)
 async def mostrar_catalogo(ctx):
-    if _catalogo_lock.locked():
-        await ctx.send("Ya hay una consulta de catálogo en marcha, espera un momento...")
-        return
-
     mensaje_espera = await ctx.send("Abriendo catalogo...")
     tiempo_inicio = time.time()
 
-    async with _catalogo_lock:
-        try:
-            resumen, smash_normales, smash_reacondicionados = await obtener_catalogo_playwright()
+    try:
+        # Llama a la nueva función que acabas de crear
+        resumen, smash_normales, smash_reacondicionados = await obtener_catalogo_api()
 
-            tiempo_fin = time.time()
-            resultado = round(tiempo_fin - tiempo_inicio, 1)
+        tiempo_fin = time.time()
+        resultado = round(tiempo_fin - tiempo_inicio, 1)
 
-            if not smash_normales and not smash_reacondicionados:
-                await mensaje_espera.edit(content="No hay resultados de Smash en la web.")
-                return
+        if not smash_normales and not smash_reacondicionados:
+            await mensaje_espera.edit(content="No hay resultados de Smash en la web.")
+            return
 
-            await mensaje_espera.delete()
-            await ctx.send(content=f"**Tiempo de respuesta: {resultado}s**")
+        await mensaje_espera.delete()
+        await ctx.send(content=f"**Tiempo de respuesta: {resultado}s**")
 
-            # --- PRIMER EMBED: Amiibos normales ---
-            descripcion_normal = resumen + "\n".join(smash_normales)
-            if len(descripcion_normal) > 4096:
-                descripcion_normal = descripcion_normal[:4093] + "..."
+        # --- PRIMER EMBED: Amiibos normales ---
+        descripcion_normal = resumen + "\n".join(smash_normales)
+        if len(descripcion_normal) > 4096:
+            descripcion_normal = descripcion_normal[:4093] + "..."
 
-            embed_normal = discord.Embed(
-                title="🛒 Catálogo de Amiibos (Smash)",
-                description=descripcion_normal,
-                color=discord.Color.blue()
+        embed_normal = discord.Embed(
+            title="🛒 Catálogo de Amiibos (Smash)",
+            description=descripcion_normal,
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed_normal)
+
+        # --- SEGUNDO EMBED: Amiibos reacondicionados ---
+        if smash_reacondicionados:
+            descripcion_reac = "\n".join(smash_reacondicionados)
+            if len(descripcion_reac) > 4096:
+                descripcion_reac = descripcion_reac[:4093] + "..."
+
+            embed_reac = discord.Embed(
+                title="♻️ Reacondicionados",
+                description=descripcion_reac,
+                color=discord.Color.green()
             )
-            await ctx.send(embed=embed_normal)
+            await ctx.send(embed=embed_reac)
 
-            # --- SEGUNDO EMBED: Amiibos reacondicionados ---
-            if smash_reacondicionados:
-                descripcion_reac = "\n".join(smash_reacondicionados)
-                if len(descripcion_reac) > 4096:
-                    descripcion_reac = descripcion_reac[:4093] + "..."
-
-                embed_reac = discord.Embed(
-                    title="♻️ Reacondicionados",
-                    description=descripcion_reac,
-                    color=discord.Color.green()
-                )
-                await ctx.send(embed=embed_reac)
-
-        except asyncio.TimeoutError:
-            await mensaje_espera.edit(content="La web de GAME ha tardado demasiado en responder. Inténtalo de nuevo en unos minutos.")
-        except Exception as e:
-            # Si algo raro pasó (crash del navegador, etc.), forzamos que se
-            # relance limpio en la próxima consulta.
-            await cerrar_browser()
-            await mensaje_espera.edit(content=f"Ha ocurrido un error al cargar la web: {e}")
+    except Exception as e:
+        await mensaje_espera.edit(content=f"Ha ocurrido un error al cargar la web: {e}")
 
 @mostrar_catalogo.error
 async def mostrar_catalogo_error(ctx, error):
@@ -416,14 +368,6 @@ async def mostrar_catalogo_error(ctx, error):
 @bot.event
 async def on_ready():
     print(f'Bot conectado como {bot.user}')
-    # Precargamos el navegador para que el primer !catalogo no pague
-    # el coste de arranque de Chromium.
-    try:
-        await obtener_browser()
-        print('Navegador listo.')
-    except Exception as e:
-        print(f'No se pudo precargar el navegador: {e}')
-
 if __name__ == '__main__':
     keep_alive()
     bot.run(TOKEN)
