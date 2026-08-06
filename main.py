@@ -17,7 +17,9 @@ ARCHIVO_ULTIMO_CATALOGO = 'ultimo_catalogo.json'
 UMBRAL_ALERTA = 14.99
 
 intents = discord.Intents.default()
-intents.message_content = True
+# Ya no hace falta message_content: todos los comandos son slash commands
+# (bot.tree), no comandos por prefijo. Si en el futuro añades comandos con
+# @bot.command, vuelve a activarlo (y en el portal de Discord Developer).
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # --- CONFIGURACIÓN DEL SERVIDOR WEB ---
@@ -117,12 +119,27 @@ async def obtener_catalogo_api():
 
     todos_los_productos = []
     pagina = 0
+    total_resultados = None  # se rellena con lo que devuelva la propia API
+    total_paginas = None
+    timeout = aiohttp.ClientTimeout(total=15)  # evita quedarse colgado si la API no responde
 
-    async with aiohttp.ClientSession() as session:
-        # 1. Llamada inicial para obtener los permisos
-        await session.get('https://www.game.es/buscar/amiibo', headers={'User-Agent': headers['User-Agent']})
-        
-        # 2. Bucle para pedir todas las páginas en orden real
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # 1. Llamada inicial: carga la página y establece las cookies de sesión
+        #    que luego se envían automáticamente en los POST (cookie jar de aiohttp).
+        try:
+            resp_inicial = await session.get('https://www.game.es/buscar/amiibo', headers={'User-Agent': headers['User-Agent']})
+            resp_inicial.release()
+            if resp_inicial.status != 200:
+                print(f"[catalogo] aviso: la carga inicial devolvió status {resp_inicial.status}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(f"[catalogo] error en la petición inicial: {e}")
+
+        # 2. Bucle de paginación siguiendo el contrato real de la API:
+        #    - Página 0: solo los campos base, FirstSearch siempre False.
+        #    - Página 1+: se añaden CurrentProducts/HotProducts/TotalResults/
+        #      TotalPages, reenviando los valores que la propia API devolvió
+        #      en la respuesta anterior (no valores inventados).
+        #    - Se para cuando ya se han acumulado TotalResults productos.
         while True:
             payload = {
                 "MinPrice": None,
@@ -133,35 +150,45 @@ async def obtener_catalogo_api():
                 "CategoryFilter": [],
                 "Category": None,
                 "TotalPages": None,
-                "FirstSearch": (pagina == 0), # True solo en la página 0
+                "FirstSearch": False,
                 "Page": pagina
             }
 
-            # Si ya no estamos en la página inicial, añadimos las etiquetas de scroll
             if pagina > 0:
                 payload["CurrentProducts"] = len(todos_los_productos)
-                payload["TotalResults"] = 200
                 payload["HotProducts"] = 0
-                payload["TotalPages"] = 1
+                payload["TotalResults"] = total_resultados
+                payload["TotalPages"] = total_paginas
 
-            async with session.post(url, headers=headers, json=payload) as response:
-                if response.status != 200:
-                    break
-                
-                try:
-                    datos = await response.json(content_type=None)
-                    productos_pagina = datos.get("Products", [])
-                    
-                    if not productos_pagina:
+            try:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    if response.status != 200:
+                        print(f"[catalogo] página {pagina}: status {response.status}, se para la paginación")
                         break
-                        
-                    todos_los_productos.extend(productos_pagina)
-                except:
-                    break
+                    datos = await response.json(content_type=None)
+            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+                print(f"[catalogo] error en página {pagina}: {e}")
+                break
+
+            productos_pagina = datos.get("Products", [])
+            if not productos_pagina:
+                break
+
+            todos_los_productos.extend(productos_pagina)
+            total_resultados = datos.get("TotalResults", total_resultados)
+            total_paginas = datos.get("TotalPages", total_paginas)
+
+            if total_resultados is not None and len(todos_los_productos) >= total_resultados:
+                break
 
             pagina += 1
-            if pagina > 5: # Límite de seguridad
+            if pagina > 10:  # límite de seguridad por si TotalResults no llega o es inconsistente
+                print("[catalogo] aviso: se alcanzó el límite de seguridad de páginas")
                 break
+
+            await asyncio.sleep(0.3)  # pequeña pausa para no golpear la API de golpe
+
+    print(f"[catalogo] productos totales obtenidos: {len(todos_los_productos)} (API reporta TotalResults={total_resultados})")
 
     # 3. Procesamos los datos extraídos
     lista_smash = []
@@ -190,10 +217,11 @@ async def obtener_catalogo_api():
         ofertas = producto.get('Offers', [])
         precio_num = 15.00
         if ofertas:
-            precio_num = ofertas[0].get('SellPrice', 15.00)
-            if precio_num is None:
+            try:
+                precio_num = float(ofertas[0].get('SellPrice') or 15.00)
+            except (TypeError, ValueError):
                 precio_num = 15.00
-                
+
         precio_str = f"{precio_num:.2f}".replace('.', ',')
 
         es_reacondicionado = "reacondicionado" in nombre_lower
@@ -306,11 +334,11 @@ async def mostrar_coleccion(interaction: discord.Interaction):
 async def mostrar_ayuda(interaction: discord.Interaction):
     texto_ayuda = (
         "**Comandos del Bot:**\n"
-        "• `!catalogo` - Muestra los Amiibos de Smash en un panel continuo.\n"
-        "• `!coleccion` - Muestra la lista completa de Amiibos que tienes guardados.\n"
-        "• `!añadir [nombre]` - Añade un Amiibo a tu colección personal.\n"
-        "• `!quitar [nombre]` - Elimina un Amiibo de tu colección personal.\n"
-        "• `!ayuda` - Muestra este menú de ayuda."
+        "• `/catalogo` - Muestra los Amiibos de Smash en un panel continuo.\n"
+        "• `/coleccion` - Muestra la lista completa de Amiibos que tienes guardados.\n"
+        "• `/añadir [nombre]` - Añade un Amiibo a tu colección personal.\n"
+        "• `/quitar [nombre]` - Elimina un Amiibo de tu colección personal.\n"
+        "• `/ayuda` - Muestra este menú de ayuda."
     )
     await interaction.response.send_message(texto_ayuda)
 
