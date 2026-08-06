@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from bs4 import BeautifulSoup
 import aiohttp
 import asyncio
 import json
