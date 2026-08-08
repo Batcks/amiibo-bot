@@ -12,9 +12,11 @@ import time
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 URL_GAME = 'https://www.game.es/buscar/amiibo'
+URL_API = 'https://www.game.es/api/search'
 ARCHIVO_COLECCION = 'mi_coleccion.json'
 ARCHIVO_ULTIMO_CATALOGO = 'ultimo_catalogo.json'
 UMBRAL_ALERTA = 14.99
+PRECIO_POR_DEFECTO = 15.00  # cuando la API no da un precio válido para un producto
 
 # --- VIGILANCIA PERIÓDICA DEL CATÁLOGO ---
 INTERVALO_MINUTOS = 15  # cada cuánto se comprueba si ha cambiado el catálogo
@@ -46,35 +48,33 @@ def keep_alive():
     t.start()
 # --------------------------------------
 
-def cargar_coleccion():
-    if os.path.exists(ARCHIVO_COLECCION):
-        with open(ARCHIVO_COLECCION, 'r', encoding='utf-8') as f:
+def cargar_json(ruta, valor_por_defecto):
+    if os.path.exists(ruta):
+        with open(ruta, 'r', encoding='utf-8') as f:
             return json.load(f)
-    return []
+    return valor_por_defecto
+
+def guardar_json(ruta, datos):
+    with open(ruta, 'w', encoding='utf-8') as f:
+        json.dump(datos, f, ensure_ascii=False, indent=4)
+
+def cargar_coleccion():
+    return cargar_json(ARCHIVO_COLECCION, [])
 
 def guardar_coleccion(coleccion):
-    with open(ARCHIVO_COLECCION, 'w', encoding='utf-8') as f:
-        json.dump(coleccion, f, ensure_ascii=False, indent=4)
+    guardar_json(ARCHIVO_COLECCION, coleccion)
 
-def cargar_ultimo_catalogo(archivo=ARCHIVO_ULTIMO_CATALOGO):
-    if os.path.exists(archivo):
-        with open(archivo, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+def cargar_ultimo_catalogo():
+    return cargar_json(ARCHIVO_ULTIMO_CATALOGO, {})
 
-def guardar_ultimo_catalogo(catalogo, archivo=ARCHIVO_ULTIMO_CATALOGO):
-    with open(archivo, 'w', encoding='utf-8') as f:
-        json.dump(catalogo, f, ensure_ascii=False, indent=4)
+def guardar_ultimo_catalogo(catalogo):
+    guardar_json(ARCHIVO_ULTIMO_CATALOGO, catalogo)
 
 def cargar_config_vigilancia():
-    if os.path.exists(ARCHIVO_VIGILANCIA_CONFIG):
-        with open(ARCHIVO_VIGILANCIA_CONFIG, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}  # {"<guild_id>": <channel_id>, ...}
+    return cargar_json(ARCHIVO_VIGILANCIA_CONFIG, {})  # {"<guild_id>": <channel_id>, ...}
 
 def guardar_config_vigilancia(config):
-    with open(ARCHIVO_VIGILANCIA_CONFIG, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
+    guardar_json(ARCHIVO_VIGILANCIA_CONFIG, config)
 
 def formatear_link(link):
     if not link:
@@ -101,13 +101,13 @@ def formatear_item(nombre, precio_str, lo_tengo, link=None, precio_num=None, mos
 
 
 async def obtener_catalogo_api():
-    url = 'https://www.game.es/api/search'
+    url = URL_API
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
         'Content-Type': 'application/json; charset=UTF-8',
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'X-Requested-With': 'XMLHttpRequest',
-        'Referer': 'https://www.game.es/buscar/amiibo'
+        'Referer': URL_GAME
     }
 
     todos_los_productos = []
@@ -120,7 +120,7 @@ async def obtener_catalogo_api():
         # 1. Llamada inicial: carga la página y establece las cookies de sesión
         #    que luego se envían automáticamente en los POST (cookie jar de aiohttp).
         try:
-            resp_inicial = await session.get('https://www.game.es/buscar/amiibo', headers={'User-Agent': headers['User-Agent']})
+            resp_inicial = await session.get(URL_GAME, headers={'User-Agent': headers['User-Agent']})
             resp_inicial.release()
             if resp_inicial.status != 200:
                 print(f"[catalogo] aviso: la carga inicial devolvió status {resp_inicial.status}")
@@ -208,12 +208,12 @@ async def obtener_catalogo_api():
         link = f"https://www.game.es/{link_parcial}" if link_parcial else None
         
         ofertas = producto.get('Offers', [])
-        precio_num = 15.00
+        precio_num = PRECIO_POR_DEFECTO
         if ofertas:
             try:
-                precio_num = float(ofertas[0].get('SellPrice') or 15.00)
+                precio_num = float(ofertas[0].get('SellPrice') or PRECIO_POR_DEFECTO)
             except (TypeError, ValueError):
-                precio_num = 15.00
+                precio_num = PRECIO_POR_DEFECTO
 
         precio_str = f"{precio_num:.2f}".replace('.', ',')
 
@@ -320,8 +320,9 @@ async def mostrar_coleccion(interaction: discord.Interaction):
         else:
             mensaje += linea
 
-    if mensaje:
-        await interaction.followup.send(mensaje)
+    # En este punto mensaje siempre tiene contenido: si coleccion estuviera
+    # vacía ya habríamos vuelto arriba (línea del "colección vacía").
+    await interaction.followup.send(mensaje)
 
 @bot.tree.command(name='ayuda',description='Muestra los comandos del bot y sus funciones')
 async def mostrar_ayuda(interaction: discord.Interaction):
@@ -428,7 +429,7 @@ async def alternar_vigilancia(interaction: discord.Interaction):
         config[guild_id] = interaction.channel_id
         guardar_config_vigilancia(config)
         await interaction.response.send_message(
-            f"✅ Vigilancia activada."
+            f"✅ Vigilancia activada en este canal (revisión cada {INTERVALO_MINUTOS} min)."
         )
 
 
@@ -456,8 +457,13 @@ async def vigilar_catalogo():
         for guild_id, canal_id in config.items():
             canal = bot.get_channel(canal_id)
             if canal is None:
-                print(f"[vigilancia] no se encontró el canal {canal_id} (guild {guild_id})")
-                continue
+                # No está en caché (p.ej. justo tras un reinicio); lo pedimos
+                # directamente a la API antes de darlo por perdido.
+                try:
+                    canal = await bot.fetch_channel(canal_id)
+                except (discord.NotFound, discord.Forbidden) as e:
+                    print(f"[vigilancia] no se pudo acceder al canal {canal_id} (guild {guild_id}): {e}")
+                    continue
             await canal.send(embed=embed)
 
     except Exception as e:
