@@ -1,10 +1,11 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import aiohttp
 import asyncio
 import json
 import os
+from datetime import datetime
 from flask import Flask
 from threading import Thread
 import time
@@ -14,6 +15,15 @@ URL_GAME = 'https://www.game.es/buscar/amiibo'
 ARCHIVO_COLECCION = 'mi_coleccion.json'
 ARCHIVO_ULTIMO_CATALOGO = 'ultimo_catalogo.json'
 UMBRAL_ALERTA = 14.99
+
+# --- VIGILANCIA PERIÓDICA DEL CATÁLOGO ---
+INTERVALO_MINUTOS = 15  # cada cuánto se comprueba si ha cambiado el catálogo
+ARCHIVO_VIGILANCIA_CONFIG = 'vigilancia_config.json'  # qué servidores/canales tienen la vigilancia activada
+# -------------------------------------------
+
+# Evita que una comprobación manual (/catalogo) y la automática se pisen
+# entre sí, y que se disparen dos tandas de peticiones a la API a la vez.
+catalogo_lock = asyncio.Lock()
 
 intents = discord.Intents.default()
 # Ya no hace falta message_content: todos los comandos son slash commands
@@ -46,41 +56,25 @@ def guardar_coleccion(coleccion):
     with open(ARCHIVO_COLECCION, 'w', encoding='utf-8') as f:
         json.dump(coleccion, f, ensure_ascii=False, indent=4)
 
-def cargar_ultimo_catalogo():
-    if os.path.exists(ARCHIVO_ULTIMO_CATALOGO):
-        with open(ARCHIVO_ULTIMO_CATALOGO, 'r', encoding='utf-8') as f:
+def cargar_ultimo_catalogo(archivo=ARCHIVO_ULTIMO_CATALOGO):
+    if os.path.exists(archivo):
+        with open(archivo, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {}
 
-def guardar_ultimo_catalogo(catalogo):
-    with open(ARCHIVO_ULTIMO_CATALOGO, 'w', encoding='utf-8') as f:
+def guardar_ultimo_catalogo(catalogo, archivo=ARCHIVO_ULTIMO_CATALOGO):
+    with open(archivo, 'w', encoding='utf-8') as f:
         json.dump(catalogo, f, ensure_ascii=False, indent=4)
 
-def limpiar_precio(precio_str):
-    """Convierte '14,99' -> 14.99. Devuelve None si no se puede."""
-    if not precio_str:
-        return None
-    try:
-        return float(precio_str.replace(',', '.'))
-    except ValueError:
-        return None
+def cargar_config_vigilancia():
+    if os.path.exists(ARCHIVO_VIGILANCIA_CONFIG):
+        with open(ARCHIVO_VIGILANCIA_CONFIG, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}  # {"<guild_id>": <channel_id>, ...}
 
-
-def extraer_precio_respaldo(articulo):
-    """Cuando data-list-item-price viene a 0, se intenta leer el precio
-    visible en el HTML (spans .int / .decimal)."""
-    entero = articulo.find('span', class_='int')
-    decimal = articulo.find('span', class_='decimal')
-    if not entero:
-        return None, None
-
-    precio_str = entero.text.strip()
-    if decimal:
-        dec_texto = decimal.text.strip().replace("'", "").replace(",", "")
-        precio_str += "," + dec_texto
-
-    return precio_str, limpiar_precio(precio_str)
-
+def guardar_config_vigilancia(config):
+    with open(ARCHIVO_VIGILANCIA_CONFIG, 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=4)
 
 def formatear_link(link):
     if not link:
@@ -277,7 +271,7 @@ async def obtener_catalogo_api():
         f"| ✅ {tengo_count} | ❌ {no_tengo_count}\n\n{texto_cambios}\n"
     )
     
-    return resumen, lista_smash, lista_reacondicionados
+    return resumen, lista_smash, lista_reacondicionados, nuevos, desaparecidos
 
 
 @bot.tree.command(name='añadir',description='Añade un amiibo a la colección')
@@ -334,6 +328,7 @@ async def mostrar_ayuda(interaction: discord.Interaction):
     texto_ayuda = (
         "**Comandos del Bot:**\n"
         "• `/catalogo` - Muestra los Amiibos de Smash en un panel continuo.\n"
+        "• `/vigilancia` - Activa/desactiva el aviso automático cuando cambie el catálogo.\n"
         "• `/coleccion` - Muestra la lista completa de Amiibos que tienes guardados.\n"
         "• `/añadir [nombre]` - Añade un Amiibo a tu colección personal.\n"
         "• `/quitar [nombre]` - Elimina un Amiibo de tu colección personal.\n"
@@ -349,7 +344,8 @@ async def mostrar_catalogo(interaction: discord.Interaction):
     tiempo_inicio = time.time()
 
     try:
-        resumen, smash_normales, smash_reacondicionados = await obtener_catalogo_api()
+        async with catalogo_lock:
+            resumen, smash_normales, smash_reacondicionados, _, _ = await obtener_catalogo_api()
 
         tiempo_fin = time.time()
         resultado = round(tiempo_fin - tiempo_inicio, 1)
@@ -398,9 +394,85 @@ async def mostrar_catalogo_error(interaction: discord.Interaction, error: app_co
     else:
         raise error
 
+
+def formatear_embed_cambios(nuevos, desaparecidos):
+    ahora = datetime.now().strftime('%d/%m/%Y %H:%M')
+
+    descripcion = ""
+    if nuevos:
+        descripcion += "**:arrow_forward: Añadido:**\n" + "\n".join(nuevos) + "\n\n"
+    if desaparecidos:
+        descripcion += "**:arrow_backward: Removido:**\n" + "\n".join(desaparecidos)
+
+    return discord.Embed(
+        title=f"**__Cambios {ahora}__**",
+        description=descripcion.strip()[:4096],
+        color=discord.Color.gold()
+    )
+
+
+@bot.tree.command(name='vigilancia', description=f'Activa o desactiva el aviso automático de cambios en el catálogo (cada {INTERVALO_MINUTOS} min)')
+async def alternar_vigilancia(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        await interaction.response.send_message("Este comando solo se puede usar dentro de un servidor.", ephemeral=True)
+        return
+
+    config = cargar_config_vigilancia()
+    guild_id = str(interaction.guild_id)
+
+    if guild_id in config:
+        del config[guild_id]
+        guardar_config_vigilancia(config)
+        await interaction.response.send_message("🛑 Vigilancia desactivada.")
+    else:
+        config[guild_id] = interaction.channel_id
+        guardar_config_vigilancia(config)
+        await interaction.response.send_message(
+            f"✅ Vigilancia activada."
+        )
+
+
+@tasks.loop(minutes=INTERVALO_MINUTOS)
+async def vigilar_catalogo():
+    config = cargar_config_vigilancia()
+    if not config:
+        return  # nadie tiene la vigilancia activada, no molestamos a la API
+
+    if catalogo_lock.locked():
+        # Ya hay una consulta en marcha (manual o automática); nos saltamos
+        # esta ronda en vez de encolarnos y acumular retraso.
+        print("[vigilancia] consulta ya en marcha, se salta esta ronda")
+        return
+
+    try:
+        async with catalogo_lock:
+            _, _, _, nuevos, desaparecidos = await obtener_catalogo_api()
+
+        if not (nuevos or desaparecidos):
+            return  # sin cambios, no se envía nada
+
+        embed = formatear_embed_cambios(nuevos, desaparecidos)
+
+        for guild_id, canal_id in config.items():
+            canal = bot.get_channel(canal_id)
+            if canal is None:
+                print(f"[vigilancia] no se encontró el canal {canal_id} (guild {guild_id})")
+                continue
+            await canal.send(embed=embed)
+
+    except Exception as e:
+        print(f"[vigilancia] error comprobando el catálogo: {e}")
+
+
+@vigilar_catalogo.before_loop
+async def antes_de_vigilar():
+    await bot.wait_until_ready()
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    if not vigilar_catalogo.is_running():
+        vigilar_catalogo.start()
     print(f'Bot conectado como {bot.user}')
 if __name__ == '__main__':
     keep_alive()
