@@ -19,7 +19,7 @@ UMBRAL_ALERTA = 14.99
 PRECIO_POR_DEFECTO = 15.00  # cuando la API no da un precio válido para un producto
 
 # --- VIGILANCIA PERIÓDICA DEL CATÁLOGO ---
-INTERVALO_MINUTOS = 20  # cada cuánto se comprueba si ha cambiado el catálogo
+INTERVALO_MINUTOS = 15  # cada cuánto se comprueba si ha cambiado el catálogo
 ARCHIVO_VIGILANCIA_CONFIG = 'vigilancia_config.json'  # qué servidores/canales tienen la vigilancia activada
 # -------------------------------------------
 
