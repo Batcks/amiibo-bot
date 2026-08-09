@@ -446,14 +446,18 @@ async def vigilar_catalogo():
         return
 
     try:
+        print(f"[vigilancia] iniciando comprobación programada ({len(config)} servidor(es) activo(s))", flush=True)
+
         async with catalogo_lock:
             _, _, _, nuevos, desaparecidos = await obtener_catalogo_api()
 
         if not (nuevos or desaparecidos):
-            return  # sin cambios, no se envía nada
+            print("[vigilancia] comprobación completada: sin cambios", flush=True)
+            return
 
         embed = formatear_embed_cambios(nuevos, desaparecidos)
 
+        enviados = 0
         for guild_id, canal_id in config.items():
             canal = bot.get_channel(canal_id)
             if canal is None:
@@ -465,6 +469,9 @@ async def vigilar_catalogo():
                     print(f"[vigilancia] no se pudo acceder al canal {canal_id} (guild {guild_id}): {e}", flush=True)
                     continue
             await canal.send(embed=embed)
+            enviados += 1
+
+        print(f"[vigilancia] cambios detectados: {len(nuevos)} nuevo(s), {len(desaparecidos)} desaparecido(s) — notificado en {enviados}/{len(config)} servidor(es)", flush=True)
 
     except Exception as e:
         print(f"[vigilancia] error comprobando el catálogo: {e}", flush=True)
