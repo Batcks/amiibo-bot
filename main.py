@@ -19,7 +19,7 @@ UMBRAL_ALERTA = 14.99
 PRECIO_POR_DEFECTO = 15.00  # cuando la API no da un precio válido para un producto
 
 # --- VIGILANCIA PERIÓDICA DEL CATÁLOGO ---
-INTERVALO_MINUTOS = 15  # cada cuánto se comprueba si ha cambiado el catálogo
+INTERVALO_MINUTOS = 20  # cada cuánto se comprueba si ha cambiado el catálogo
 ARCHIVO_VIGILANCIA_CONFIG = 'vigilancia_config.json'  # qué servidores/canales tienen la vigilancia activada
 # -------------------------------------------
 
@@ -123,9 +123,9 @@ async def obtener_catalogo_api():
             resp_inicial = await session.get(URL_GAME, headers={'User-Agent': headers['User-Agent']})
             resp_inicial.release()
             if resp_inicial.status != 200:
-                print(f"[catalogo] aviso: la carga inicial devolvió status {resp_inicial.status}")
+                print(f"[catalogo] aviso: la carga inicial devolvió status {resp_inicial.status}", flush=True)
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"[catalogo] error en la petición inicial: {e}")
+            print(f"[catalogo] error en la petición inicial: {e}", flush=True)
 
         # 2. Bucle de paginación siguiendo el contrato real de la API:
         #    - Página 0: solo los campos base, FirstSearch siempre False.
@@ -156,11 +156,11 @@ async def obtener_catalogo_api():
             try:
                 async with session.post(url, headers=headers, json=payload) as response:
                     if response.status != 200:
-                        print(f"[catalogo] página {pagina}: status {response.status}, se para la paginación")
+                        print(f"[catalogo] página {pagina}: status {response.status}, se para la paginación", flush=True)
                         break
                     datos = await response.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-                print(f"[catalogo] error en página {pagina}: {e}")
+                print(f"[catalogo] error en página {pagina}: {e}", flush=True)
                 break
 
             productos_pagina = datos.get("Products", [])
@@ -176,12 +176,12 @@ async def obtener_catalogo_api():
 
             pagina += 1
             if pagina > 10:  # límite de seguridad por si TotalResults no llega o es inconsistente
-                print("[catalogo] aviso: se alcanzó el límite de seguridad de páginas")
+                print("[catalogo] aviso: se alcanzó el límite de seguridad de páginas", flush=True)
                 break
 
             await asyncio.sleep(0.3)  # pequeña pausa para no golpear la API de golpe
 
-    print(f"[catalogo] productos totales obtenidos: {len(todos_los_productos)} (API reporta TotalResults={total_resultados})")
+    print(f"[catalogo] productos totales obtenidos: {len(todos_los_productos)} (API reporta TotalResults={total_resultados})", flush=True)
 
     # 3. Procesamos los datos extraídos
     lista_smash = []
@@ -442,7 +442,7 @@ async def vigilar_catalogo():
     if catalogo_lock.locked():
         # Ya hay una consulta en marcha (manual o automática); nos saltamos
         # esta ronda en vez de encolarnos y acumular retraso.
-        print("[vigilancia] consulta ya en marcha, se salta esta ronda")
+        print("[vigilancia] consulta ya en marcha, se salta esta ronda", flush=True)
         return
 
     try:
@@ -462,12 +462,12 @@ async def vigilar_catalogo():
                 try:
                     canal = await bot.fetch_channel(canal_id)
                 except (discord.NotFound, discord.Forbidden) as e:
-                    print(f"[vigilancia] no se pudo acceder al canal {canal_id} (guild {guild_id}): {e}")
+                    print(f"[vigilancia] no se pudo acceder al canal {canal_id} (guild {guild_id}): {e}", flush=True)
                     continue
             await canal.send(embed=embed)
 
     except Exception as e:
-        print(f"[vigilancia] error comprobando el catálogo: {e}")
+        print(f"[vigilancia] error comprobando el catálogo: {e}", flush=True)
 
 
 @vigilar_catalogo.before_loop
@@ -479,7 +479,7 @@ async def on_ready():
     await bot.tree.sync()
     if not vigilar_catalogo.is_running():
         vigilar_catalogo.start()
-    print(f'Bot conectado como {bot.user}')
+    print(f'Bot conectado como {bot.user}', flush=True)
 if __name__ == '__main__':
     keep_alive()
     bot.run(TOKEN)
