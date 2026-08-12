@@ -43,7 +43,7 @@ def determinar_categoria(nombre_lower):
 # ------------------------------
 
 # --- VIGILANCIA PERIÓDICA DEL CATÁLOGO ---
-INTERVALO_MINUTOS = 15  # cada cuánto se comprueba si ha cambiado el catálogo
+INTERVALO_MINUTOS = 60  # cada cuánto se comprueba si ha cambiado el catálogo
 ARCHIVO_VIGILANCIA_CONFIG = 'vigilancia_config.json'  # qué servidores/canales tienen la vigilancia activada
 # -------------------------------------------
 
