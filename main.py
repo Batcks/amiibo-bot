@@ -18,6 +18,30 @@ ARCHIVO_ULTIMO_CATALOGO = 'ultimo_catalogo.json'
 UMBRAL_ALERTA = 14.99
 PRECIO_POR_DEFECTO = 15.00  # cuando la API no da un precio válido para un producto
 
+# --- CATEGORÍAS DE AMIIBOS ---
+# Orden de prioridad (de arriba a abajo) Y de visualización. Un producto cae
+# en la primera categoría cuya palabra clave aparezca en su nombre; si no
+# coincide con ninguna, va a "otros". Para añadir una categoría nueva, solo
+# hay que añadir una tupla aquí (clave, etiqueta visible, palabra a buscar).
+CATEGORIAS = [
+    ("smash", "Smash", "smash"),
+    ("mario", "Super Mario", "mario"),
+]
+CLAVE_OTROS = "otros"
+ETIQUETA_OTROS = "Otros"
+CLAVES_CATEGORIAS = [clave for clave, _, _ in CATEGORIAS] + [CLAVE_OTROS]
+ETIQUETAS_CATEGORIAS = {clave: etiqueta for clave, etiqueta, _ in CATEGORIAS}
+ETIQUETAS_CATEGORIAS[CLAVE_OTROS] = ETIQUETA_OTROS
+CATEGORIA_CON_ALERTA = "smash"  # única categoría en la que se muestra 🚨 por precio bajo
+CATEGORIA_COLECCIONABLE = "smash"  # única categoría en la que aplica /añadir, /quitar y el tachado
+
+def determinar_categoria(nombre_lower):
+    for clave, _, palabra in CATEGORIAS:
+        if palabra in nombre_lower:
+            return clave
+    return CLAVE_OTROS
+# ------------------------------
+
 # --- VIGILANCIA PERIÓDICA DEL CATÁLOGO ---
 INTERVALO_MINUTOS = 15  # cada cuánto se comprueba si ha cambiado el catálogo
 ARCHIVO_VIGILANCIA_CONFIG = 'vigilancia_config.json'  # qué servidores/canales tienen la vigilancia activada
@@ -59,7 +83,21 @@ def guardar_json(ruta, datos):
         json.dump(datos, f, ensure_ascii=False, indent=4)
 
 def cargar_coleccion():
-    return cargar_json(ARCHIVO_COLECCION, [])
+    datos = cargar_json(ARCHIVO_COLECCION, None)
+
+    if datos is None:
+        return []
+
+    if isinstance(datos, dict):
+        # Formato con categorías (de una versión anterior del bot). Se
+        # recupera solo la parte "smash", que es la única coleccionable
+        # ahora, y se guarda ya como lista plana.
+        migrado = datos.get("smash", [])
+        guardar_coleccion(migrado)
+        print(f"[coleccion] migrado mi_coleccion.json de dict por categoría a lista plana ({len(migrado)} amiibo(s) de smash)", flush=True)
+        return migrado
+
+    return datos
 
 def guardar_coleccion(coleccion):
     guardar_json(ARCHIVO_COLECCION, coleccion)
@@ -100,6 +138,73 @@ def formatear_item(nombre, precio_str, lo_tengo, link=None, precio_num=None, mos
     return f"{nombre} — {precio_str}€{alerta}"
 
 
+def dividir_en_embeds(titulo, descripcion, color):
+    """Divide una descripción larga en varios embeds si supera el límite de
+    Discord (4096 caracteres por embed), cortando siempre por líneas
+    completas (nunca a mitad de un amiibo)."""
+    limite = 4096
+    lineas = descripcion.split("\n")
+    partes = []
+    actual = ""
+    for linea in lineas:
+        candidato = f"{actual}\n{linea}" if actual else linea
+        if len(candidato) > limite:
+            if actual:
+                partes.append(actual)
+            actual = linea  # si una sola línea ya supera el límite, se envía tal cual
+        else:
+            actual = candidato
+    if actual:
+        partes.append(actual)
+    if not partes:
+        partes = [""]
+
+    embeds = []
+    for i, parte in enumerate(partes):
+        titulo_parte = titulo if len(partes) == 1 else f"{titulo} ({i + 1}/{len(partes)})"
+        embeds.append(discord.Embed(title=titulo_parte, description=parte, color=color))
+    return embeds
+
+
+def construir_secciones(categorias, tipo):
+    """Construye los bloques de texto '**Etiqueta:**\\n...' para un tipo
+    (normal/reacondicionado), en el orden de CLAVES_CATEGORIAS, omitiendo
+    las categorías vacías."""
+    secciones = []
+    for clave in CLAVES_CATEGORIAS:
+        lista = categorias[clave][tipo]
+        if lista:
+            secciones.append(f"**{ETIQUETAS_CATEGORIAS[clave]}:**\n" + "\n".join(lista))
+    return secciones
+
+
+# --- SESIÓN HTTP PERSISTENTE ---
+# Reutilizada entre llamadas en vez de crear una aiohttp.ClientSession nueva
+# en cada consulta: evita repetir el handshake TCP/TLS constantemente y
+# mantiene las cookies de sesión de forma continua (más parecido a un
+# navegador normal que abrir/cerrar sesión en cada ronda de vigilancia).
+_sesion_http = None
+
+async def obtener_sesion_http():
+    global _sesion_http
+    if _sesion_http is None or _sesion_http.closed:
+        timeout = aiohttp.ClientTimeout(total=15)  # evita quedarse colgado si la API no responde
+        _sesion_http = aiohttp.ClientSession(timeout=timeout)
+    return _sesion_http
+
+async def cerrar_sesion_http():
+    """Fuerza que se cree una sesión nueva en la siguiente consulta (se usa
+    cuando algo ha ido mal, para no quedarnos arrastrando una sesión rota)."""
+    global _sesion_http
+    if _sesion_http is not None:
+        try:
+            await _sesion_http.close()
+        except Exception:
+            pass
+        _sesion_http = None
+# --------------------------------
+
+
 async def obtener_catalogo_api():
     url = URL_API
     headers = {
@@ -114,99 +219,98 @@ async def obtener_catalogo_api():
     pagina = 0
     total_resultados = None  # se rellena con lo que devuelva la propia API
     total_paginas = None
-    timeout = aiohttp.ClientTimeout(total=15)  # evita quedarse colgado si la API no responde
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        # 1. Llamada inicial: carga la página y establece las cookies de sesión
-        #    que luego se envían automáticamente en los POST (cookie jar de aiohttp).
+    session = await obtener_sesion_http()
+
+    # 1. Llamada inicial: carga la página y establece las cookies de sesión
+    #    que luego se envían automáticamente en los POST (cookie jar de aiohttp).
+    try:
+        resp_inicial = await session.get(URL_GAME, headers={'User-Agent': headers['User-Agent']})
+        resp_inicial.release()
+        if resp_inicial.status != 200:
+            print(f"[catalogo] aviso: la carga inicial devolvió status {resp_inicial.status}", flush=True)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[catalogo] error en la petición inicial: {e}", flush=True)
+
+    # 2. Bucle de paginación siguiendo el contrato real de la API:
+    #    - Página 0: solo los campos base, FirstSearch siempre False.
+    #    - Página 1+: se añaden CurrentProducts/HotProducts/TotalResults/
+    #      TotalPages, reenviando los valores que la propia API devolvió
+    #      en la respuesta anterior (no valores inventados).
+    #    - Se para cuando ya se han acumulado TotalResults productos.
+    while True:
+        payload = {
+            "MinPrice": None,
+            "MaxPrice": None,
+            "Head": "amiibo",
+            "SKU": "",
+            "Order": 7,
+            "CategoryFilter": [],
+            "Category": None,
+            "TotalPages": None,
+            "FirstSearch": False,
+            "Page": pagina
+        }
+
+        if pagina > 0:
+            payload["CurrentProducts"] = len(todos_los_productos)
+            payload["HotProducts"] = 0
+            payload["TotalResults"] = total_resultados
+            payload["TotalPages"] = total_paginas
+
         try:
-            resp_inicial = await session.get(URL_GAME, headers={'User-Agent': headers['User-Agent']})
-            resp_inicial.release()
-            if resp_inicial.status != 200:
-                print(f"[catalogo] aviso: la carga inicial devolvió status {resp_inicial.status}", flush=True)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"[catalogo] error en la petición inicial: {e}", flush=True)
+            async with session.post(url, headers=headers, json=payload) as response:
+                if response.status != 200:
+                    print(f"[catalogo] página {pagina}: status {response.status}, se para la paginación", flush=True)
+                    break
+                datos = await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
+            print(f"[catalogo] error en página {pagina}: {e}", flush=True)
+            break
 
-        # 2. Bucle de paginación siguiendo el contrato real de la API:
-        #    - Página 0: solo los campos base, FirstSearch siempre False.
-        #    - Página 1+: se añaden CurrentProducts/HotProducts/TotalResults/
-        #      TotalPages, reenviando los valores que la propia API devolvió
-        #      en la respuesta anterior (no valores inventados).
-        #    - Se para cuando ya se han acumulado TotalResults productos.
-        while True:
-            payload = {
-                "MinPrice": None,
-                "MaxPrice": None,
-                "Head": "amiibo",
-                "SKU": "",
-                "Order": 7,
-                "CategoryFilter": [],
-                "Category": None,
-                "TotalPages": None,
-                "FirstSearch": False,
-                "Page": pagina
-            }
+        productos_pagina = datos.get("Products", [])
+        if not productos_pagina:
+            break
 
-            if pagina > 0:
-                payload["CurrentProducts"] = len(todos_los_productos)
-                payload["HotProducts"] = 0
-                payload["TotalResults"] = total_resultados
-                payload["TotalPages"] = total_paginas
+        todos_los_productos.extend(productos_pagina)
+        total_resultados = datos.get("TotalResults", total_resultados)
+        total_paginas = datos.get("TotalPages", total_paginas)
 
-            try:
-                async with session.post(url, headers=headers, json=payload) as response:
-                    if response.status != 200:
-                        print(f"[catalogo] página {pagina}: status {response.status}, se para la paginación", flush=True)
-                        break
-                    datos = await response.json(content_type=None)
-            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as e:
-                print(f"[catalogo] error en página {pagina}: {e}", flush=True)
-                break
+        if total_resultados is not None and len(todos_los_productos) >= total_resultados:
+            break
 
-            productos_pagina = datos.get("Products", [])
-            if not productos_pagina:
-                break
+        pagina += 1
+        if pagina > 10:  # límite de seguridad por si TotalResults no llega o es inconsistente
+            print("[catalogo] aviso: se alcanzó el límite de seguridad de páginas", flush=True)
+            break
 
-            todos_los_productos.extend(productos_pagina)
-            total_resultados = datos.get("TotalResults", total_resultados)
-            total_paginas = datos.get("TotalPages", total_paginas)
-
-            if total_resultados is not None and len(todos_los_productos) >= total_resultados:
-                break
-
-            pagina += 1
-            if pagina > 10:  # límite de seguridad por si TotalResults no llega o es inconsistente
-                print("[catalogo] aviso: se alcanzó el límite de seguridad de páginas", flush=True)
-                break
-
-            await asyncio.sleep(0.3)  # pequeña pausa para no golpear la API de golpe
+        await asyncio.sleep(0.3)  # pequeña pausa para no golpear la API de golpe
 
     print(f"[catalogo] productos totales obtenidos: {len(todos_los_productos)} (API reporta TotalResults={total_resultados})", flush=True)
 
     # 3. Procesamos los datos extraídos
-    lista_smash = []
-    lista_reacondicionados = []
     coleccion = [c.lower() for c in cargar_coleccion()]
-    
-    ultimo_catalogo = cargar_ultimo_catalogo()
     catalogo_actual = {}
-    
-    total_encontrados = 0
-    tengo_count = 0
-    no_tengo_count = 0
-    
+
+    # listas[clave]["normal" | "reacondicionado"] -> lista de líneas de texto
+    listas = {clave: {"normal": [], "reacondicionado": []} for clave in CLAVES_CATEGORIAS}
+    tengo_smash = 0
+    no_tengo_smash = 0
+
     for producto in todos_los_productos:
         nombre = producto.get('Name')
         if not nombre:
             continue
-            
+
         nombre_lower = nombre.lower()
-        if "smash" not in nombre_lower:
-            continue
-            
+        categoria = determinar_categoria(nombre_lower)
+        es_reacondicionado = "reacondicionado" in nombre_lower
+        # La colección (y por tanto el tachado) solo aplica a Smash.
+        lo_tengo = categoria == CATEGORIA_COLECCIONABLE and any(item in nombre_lower for item in coleccion)
+
         link_parcial = producto.get('Navigation', '')
         link = f"https://www.game.es/{link_parcial}" if link_parcial else None
-        
+
         ofertas = producto.get('Offers', [])
         precio_num = PRECIO_POR_DEFECTO
         if ofertas:
@@ -217,65 +321,73 @@ async def obtener_catalogo_api():
 
         precio_str = f"{precio_num:.2f}".replace('.', ',')
 
-        es_reacondicionado = "reacondicionado" in nombre_lower
-        lo_tengo = any(item in nombre_lower for item in coleccion)
-            
-        if es_reacondicionado:
-            texto = formatear_item(nombre, precio_str, lo_tengo, link=link, mostrar_alerta=False)
-            lista_reacondicionados.append(texto)
-        else:
+        mostrar_alerta = categoria == CATEGORIA_CON_ALERTA and not es_reacondicionado
+
+        texto = formatear_item(
+            nombre, precio_str, lo_tengo,
+            link=link, precio_num=precio_num, mostrar_alerta=mostrar_alerta
+        )
+
+        tipo = "reacondicionado" if es_reacondicionado else "normal"
+        listas[categoria][tipo].append(texto)
+
+        if not es_reacondicionado:
             catalogo_actual[nombre] = precio_str
-            total_encontrados += 1
-            
-            if lo_tengo:
-                tengo_count += 1
-            else:
-                no_tengo_count += 1
-                
-            texto = formatear_item(
-                nombre, precio_str, lo_tengo,
-                link=link, precio_num=precio_num, mostrar_alerta=True
+            if categoria == CATEGORIA_COLECCIONABLE:
+                if lo_tengo:
+                    tengo_smash += 1
+                else:
+                    no_tengo_smash += 1
+
+    lineas_resumen = []
+    for clave in CLAVES_CATEGORIAS:
+        etiqueta = ETIQUETAS_CATEGORIAS[clave]
+        total = len(listas[clave]["normal"])
+        reac = len(listas[clave]["reacondicionado"])
+        if clave == CATEGORIA_COLECCIONABLE:
+            lineas_resumen.append(
+                f"📊 {etiqueta}: {total} (♻️ {reac}) | ✅ {tengo_smash} | ❌ {no_tengo_smash}"
             )
-            lista_smash.append(texto)
-            
+        else:
+            lineas_resumen.append(f"📊 {etiqueta}: {total} (♻️ {reac})")
+
+    resumen = "\n".join(lineas_resumen) + "\n\n"
+
+    return {
+        "resumen": resumen,
+        "categorias": listas,
+        "catalogo_actual": catalogo_actual,
+    }
+
+
+def detectar_cambios(catalogo_actual):
+    """Compara catalogo_actual con el último catálogo guardado
+    (ultimo_catalogo.json), actualiza el archivo y devuelve (nuevos,
+    desaparecidos) como listas de texto 'nombre — precio€'.
+
+    Esta es la ÚNICA función que lee/escribe ultimo_catalogo.json — ni
+    /catalogo ni obtener_catalogo_api() lo tocan; solo /cambios y la
+    vigilancia automática llaman a esto."""
+    ultimo_catalogo = cargar_ultimo_catalogo()
+
     nuevos = []
     desaparecidos = []
-    
+
     for nombre, precio in catalogo_actual.items():
         if nombre not in ultimo_catalogo:
             nuevos.append(f"{nombre} — {precio}€")
-            
+
     for nombre, precio in ultimo_catalogo.items():
         if nombre not in catalogo_actual:
             desaparecidos.append(f"{nombre} — {precio}€")
-            
-    texto_cambios = ""
-    if not ultimo_catalogo:
-        texto_cambios = "No hay nuevos cambios\n"
-    elif nuevos or desaparecidos:
-        if nuevos:
-            texto_cambios += "**Nuevo:**\n"
-            for item in nuevos:
-                texto_cambios += f"     {item}\n"
-        if desaparecidos:
-            texto_cambios += "**Desaparece:**\n"
-            for item in desaparecidos:
-                texto_cambios += f"     {item}\n"
-    else:
-        texto_cambios = "No hay nuevos cambios\n"
-        
+
     guardar_ultimo_catalogo(catalogo_actual)
-    
-    resumen = (
-        f"📊 Total: {total_encontrados} (♻️ {len(lista_reacondicionados)}) "
-        f"| ✅ {tengo_count} | ❌ {no_tengo_count}\n\n{texto_cambios}\n"
-    )
-    
-    return resumen, lista_smash, lista_reacondicionados, nuevos, desaparecidos
+
+    return nuevos, desaparecidos
 
 
-@bot.tree.command(name='añadir',description='Añade un amiibo a la colección')
-async def añadir_coleccion(interaction: discord.Interaction, *, nombre: str):
+@bot.tree.command(name='añadir', description='Añade un amiibo de Smash a tu colección')
+async def añadir_coleccion(interaction: discord.Interaction, nombre: str):
     coleccion = cargar_coleccion()
     if nombre not in coleccion:
         coleccion.append(nombre)
@@ -284,8 +396,8 @@ async def añadir_coleccion(interaction: discord.Interaction, *, nombre: str):
     else:
         await interaction.response.send_message(f"**{nombre}** ya estaba en tu colección.")
 
-@bot.tree.command(name='quitar',description='Quita un amiibo de la colección')
-async def quitar_coleccion(interaction: discord.Interaction, *, nombre: str):
+@bot.tree.command(name='quitar', description='Quita un amiibo de Smash de tu colección')
+async def quitar_coleccion(interaction: discord.Interaction, nombre: str):
     coleccion = cargar_coleccion()
     encontrado = None
     for item in coleccion:
@@ -328,11 +440,12 @@ async def mostrar_coleccion(interaction: discord.Interaction):
 async def mostrar_ayuda(interaction: discord.Interaction):
     texto_ayuda = (
         "**Comandos del Bot:**\n"
-        "• `/catalogo` - Muestra los Amiibos de Smash en un panel continuo.\n"
+        "• `/catalogo` - Muestra el catálogo de Amiibos (Smash y otros) en un panel continuo.\n"
+        "• `/cambios` - Comprueba manualmente si ha cambiado el catálogo desde la última vez.\n"
         "• `/vigilancia` - Activa/desactiva el aviso automático cuando cambie el catálogo.\n"
-        "• `/coleccion` - Muestra la lista completa de Amiibos que tienes guardados.\n"
-        "• `/añadir [nombre]` - Añade un Amiibo a tu colección personal.\n"
-        "• `/quitar [nombre]` - Elimina un Amiibo de tu colección personal.\n"
+        "• `/coleccion` - Muestra tu colección de amiibos de Smash.\n"
+        "• `/añadir [nombre]` - Añade un Amiibo de Smash a tu colección personal.\n"
+        "• `/quitar [nombre]` - Elimina un Amiibo de Smash de tu colección personal.\n"
         "• `/ayuda` - Muestra este menú de ayuda."
     )
     await interaction.response.send_message(texto_ayuda)
@@ -346,46 +459,42 @@ async def mostrar_catalogo(interaction: discord.Interaction):
 
     try:
         async with catalogo_lock:
-            resumen, smash_normales, smash_reacondicionados, _, _ = await obtener_catalogo_api()
+            datos = await obtener_catalogo_api()
 
         tiempo_fin = time.time()
         resultado = round(tiempo_fin - tiempo_inicio, 1)
 
-        if not smash_normales and not smash_reacondicionados:
-            await interaction.edit_original_response(content="No hay resultados de Smash en la web.")
+        categorias = datos["categorias"]
+        hay_resultados = any(
+            categorias[clave][tipo]
+            for clave in CLAVES_CATEGORIAS
+            for tipo in ("normal", "reacondicionado")
+        )
+
+        if not hay_resultados:
+            await interaction.edit_original_response(content="No hay resultados de amiibo en la web.")
             return
 
         # 2. Modificamos el mensaje inicial de carga con el tiempo de respuesta
         await interaction.edit_original_response(content=f"**Tiempo de respuesta: {resultado}s**")
 
-        # --- PRIMER EMBED: Amiibos normales ---
-        descripcion_normal = resumen + "\n".join(smash_normales)
-        if len(descripcion_normal) > 4096:
-            descripcion_normal = descripcion_normal[:4093] + "..."
+        # --- PRIMER EMBED (o varios si no cabe): normales, en orden de categorías ---
+        secciones_normal = construir_secciones(categorias, "normal")
+        descripcion_normal = datos["resumen"] + "\n\n".join(secciones_normal)
 
-        embed_normal = discord.Embed(
-            title="🛒 Catálogo de Amiibos (Smash)",
-            description=descripcion_normal,
-            color=discord.Color.blue()
-        )
-        
         # Para enviar los embeds extra usamos followup porque ya respondimos antes
-        await interaction.followup.send(embed=embed_normal)
+        for embed in dividir_en_embeds("🛒 Catálogo de Amiibos", descripcion_normal, discord.Color.blue()):
+            await interaction.followup.send(embed=embed)
 
-        # --- SEGUNDO EMBED: Amiibos reacondicionados ---
-        if smash_reacondicionados:
-            descripcion_reac = "\n".join(smash_reacondicionados)
-            if len(descripcion_reac) > 4096:
-                descripcion_reac = descripcion_reac[:4093] + "..."
-
-            embed_reac = discord.Embed(
-                title="♻️ Reacondicionados",
-                description=descripcion_reac,
-                color=discord.Color.green()
-            )
-            await interaction.followup.send(embed=embed_reac)
+        # --- SEGUNDO EMBED (o varios): reacondicionados, mismo orden de categorías ---
+        secciones_reac = construir_secciones(categorias, "reacondicionado")
+        if secciones_reac:
+            descripcion_reac = "\n\n".join(secciones_reac)
+            for embed in dividir_en_embeds("♻️ Reacondicionados", descripcion_reac, discord.Color.green()):
+                await interaction.followup.send(embed=embed)
 
     except Exception as e:
+        await cerrar_sesion_http()
         await interaction.edit_original_response(content=f"Ha ocurrido un error al cargar la web: {e}")
 
 @mostrar_catalogo.error
@@ -396,7 +505,7 @@ async def mostrar_catalogo_error(interaction: discord.Interaction, error: app_co
         raise error
 
 
-def formatear_embed_cambios(nuevos, desaparecidos):
+def formatear_embeds_cambios(nuevos, desaparecidos):
     ahora = datetime.now().strftime('%d/%m/%Y %H:%M')
 
     descripcion = ""
@@ -405,11 +514,39 @@ def formatear_embed_cambios(nuevos, desaparecidos):
     if desaparecidos:
         descripcion += "**:arrow_backward: Removido:**\n" + "\n".join(desaparecidos)
 
-    return discord.Embed(
-        title=f"**__Cambios {ahora}__**",
-        description=descripcion.strip()[:4096],
-        color=discord.Color.gold()
-    )
+    return dividir_en_embeds(f"**__Cambios {ahora}__**", descripcion.strip(), discord.Color.gold())
+
+
+@bot.tree.command(name='cambios', description='Comprueba si ha cambiado el catálogo desde la última vez')
+@app_commands.checks.cooldown(1, 15, key=lambda i: i.guild_id)
+async def mostrar_cambios(interaction: discord.Interaction):
+    await interaction.response.send_message("Comprobando cambios...")
+
+    try:
+        async with catalogo_lock:
+            datos = await obtener_catalogo_api()
+            nuevos, desaparecidos = detectar_cambios(datos["catalogo_actual"])
+
+        if not (nuevos or desaparecidos):
+            await interaction.edit_original_response(content="No hay cambios desde la última comprobación.")
+            return
+
+        await interaction.edit_original_response(
+            content=f"Se han detectado cambios: {len(nuevos)} nuevo(s), {len(desaparecidos)} desaparecido(s)."
+        )
+        for embed in formatear_embeds_cambios(nuevos, desaparecidos):
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await cerrar_sesion_http()
+        await interaction.edit_original_response(content=f"Ha ocurrido un error al comprobar cambios: {e}")
+
+@mostrar_cambios.error
+async def mostrar_cambios_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(f"Espera {error.retry_after:.0f}s antes de volver a comprobar cambios.", ephemeral=True)
+    else:
+        raise error
 
 
 @bot.tree.command(name='vigilancia', description=f'Activa o desactiva el aviso automático de cambios en el catálogo (cada {INTERVALO_MINUTOS} min)')
@@ -449,13 +586,14 @@ async def vigilar_catalogo():
         print(f"[vigilancia] iniciando comprobación programada ({len(config)} servidor(es) activo(s))", flush=True)
 
         async with catalogo_lock:
-            _, _, _, nuevos, desaparecidos = await obtener_catalogo_api()
+            datos = await obtener_catalogo_api()
+            nuevos, desaparecidos = detectar_cambios(datos["catalogo_actual"])
 
         if not (nuevos or desaparecidos):
             print("[vigilancia] comprobación completada: sin cambios", flush=True)
             return
 
-        embed = formatear_embed_cambios(nuevos, desaparecidos)
+        embeds = formatear_embeds_cambios(nuevos, desaparecidos)
 
         enviados = 0
         for guild_id, canal_id in config.items():
@@ -468,12 +606,14 @@ async def vigilar_catalogo():
                 except (discord.NotFound, discord.Forbidden) as e:
                     print(f"[vigilancia] no se pudo acceder al canal {canal_id} (guild {guild_id}): {e}", flush=True)
                     continue
-            await canal.send(embed=embed)
+            for embed in embeds:
+                await canal.send(embed=embed)
             enviados += 1
 
         print(f"[vigilancia] cambios detectados: {len(nuevos)} nuevo(s), {len(desaparecidos)} desaparecido(s) — notificado en {enviados}/{len(config)} servidor(es)", flush=True)
 
     except Exception as e:
+        await cerrar_sesion_http()
         print(f"[vigilancia] error comprobando el catálogo: {e}", flush=True)
 
 
